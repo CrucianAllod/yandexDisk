@@ -2,118 +2,98 @@ from django.core.cache import cache
 from django.shortcuts import render
 from django.http import HttpResponse, HttpResponseBadRequest
 from django.views import View
-import requests
 import mimetypes
 import urllib.parse
-import zipfile
-import io
 import datetime
 # Импортируем mime_types для регистрации MIME-типов
 import disk.mime_types
+from disk.services import file_list, filter_files_by_type, download_file, multiple_download_files
+from typing import Optional, List
 
 
 class FileListView(View):
-    def get(self, request):
-       return  render(request, 'disk/index.html')
+    def get(self, request) -> HttpResponse:
+        """
+        Обрабатывает GET-запрос для отображения начальной страницы.
 
-    def post(self, request):
-        public_key = request.POST.get('public_key')
-        file_type = request.POST.get('file_type', 'all')
-        cache_key = f"file_list_{public_key}"
-        items = cache.get(cache_key)
+        :param request: HTTP-запрос
+        :return: HTTP-ответ с рендерингом начальной страницы
+        """
+        return render(request, 'disk/index.html')
+
+    def post(self, request) -> HttpResponse:
+        """
+        Обрабатывает POST-запрос для получения и отображения списка файлов.
+
+        :param request: HTTP-запрос
+        :return: HTTP-ответ с рендерингом страницы и списком файлов
+        """
+        public_key: str = request.POST.get('public_key')
+        file_type: str = request.POST.get('file_type', 'all')
+        cache_key: str = f"file_list_{public_key}"
+
+        # Получаем список файлов из кэша, если доступен
+        items: Optional[List[dict]] = cache.get(cache_key)
         if items is None:
-            url = f'https://cloud-api.yandex.net/v1/disk/public/resources?public_key={public_key}'
-            response = requests.get(url)
-            if response.status_code == 200:
-                items = response.json().get('_embedded', {}).get('items', [])
-                cache.set(cache_key, items, 300)
+            # Получаем список файлов с Яндекс.Диска
+            items = file_list(public_key)
+            if items is not None:
+                # Сохраняем список файлов в кэш
+                cache.set(cache_key, items, 3600)
             else:
                 return HttpResponseBadRequest('Ошибка при получении списка файлов')
-            # Фильтрация файлов по типу
-        if file_type == 'documents':
-            items = [item for item in items if item['type'] == 'file' and self.is_document(item['name'])]
-        elif file_type == 'images':
-            items = [item for item in items if item['type'] == 'file' and self.is_image(item['name'])]
+
+        # Фильтруем файлы по типу
+        items = filter_files_by_type(items, file_type)
 
         return render(request, 'disk/index.html', {'items': items, 'public_key': public_key})
 
 
-    def is_document(self, file_name):
-        # Проверка, является ли файл документом
-        document_types = [
-            'application/pdf',
-            'application/msword',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            'application/vnd.ms-excel',
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'application/vnd.ms-powerpoint',
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-        ]
-        mime_type, _ = mimetypes.guess_type(file_name)
-        return mime_type in document_types
-
-    def is_image(self, file_name):
-        # Проверка, является ли файл изображением
-        image_types = ['image/jpeg', 'image/png', 'image/gif']
-        mime_type, _ = mimetypes.guess_type(file_name)
-        return mime_type in image_types
-
 class FileDownloadView(View):
-    def get(self, request):
-        public_key = request.GET.get('public_key')
-        path = request.GET.get('path')
-        url = f'https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={public_key}&path={path}'
-        response = requests.get(url)
-        if response.status_code == 200:
-            download_url = response.json().get('href')
-            file_response = requests.get(download_url)
-            if file_response.status_code == 200:
-                # Определяем MIME-тип файла
-                file_name = path.split('/')[-1]
-                mime_type, _ = mimetypes.guess_type(file_name)
-                encoded_file_name = urllib.parse.quote(file_name, safe='')
+    def get(self, request) -> HttpResponse:
+        """
+        Обрабатывает GET-запрос для скачивания одного файла.
 
-                # Устанавливаем заголовки ответа
-                response = HttpResponse(file_response.content, content_type=mime_type or 'application/octet-stream')
-                response['Content-Disposition'] = f"attachment; filename={file_name}; filename*=UTF-8''{encoded_file_name}"
-                return response
+        :param request: HTTP-запрос
+        :return: HTTP-ответ с содержимым файла для скачивания
+        """
+        public_key: str = request.GET.get('public_key')
+        path: str = request.GET.get('path')
+        file_content: Optional[bytes]
+        file_name: Optional[str]
+
+        file_content, file_name = download_file(public_key, path)
+
+        if file_content:
+            mime_type, _ = mimetypes.guess_type(file_name)
+            encoded_file_name = urllib.parse.quote(file_name, safe='')
+
+            response = HttpResponse(file_content, content_type=mime_type or 'application/octet-stream')
+            response['Content-Disposition'] = f"attachment; filename={file_name}; filename*=UTF-8''{encoded_file_name}"
+            return response
+
         return HttpResponseBadRequest('Ошибка при загрузке файла', status=500)
 
 
 class FileMultipleDownloadView(View):
-    def post(self, request):
-        public_key = request.POST.get('public_key')
-        paths = request.POST.getlist('files')
+    def post(self, request) -> HttpResponse:
+        """
+        Обрабатывает POST-запрос для скачивания нескольких файлов в виде ZIP-архива.
+
+        :param request: HTTP-запрос
+        :return: HTTP-ответ с ZIP-архивом для скачивания
+        """
+        public_key: str = request.POST.get('public_key')
+        paths: List[str] = request.POST.getlist('files')
 
         if not paths:
             return HttpResponseBadRequest('Не выбрано ни одного файла.')
 
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for path in paths:
-                encoded_path = urllib.parse.quote(path)
-                url = f'https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={public_key}&path={encoded_path}'
-                response = requests.get(url)
+        # Получаем содержимое ZIP-архива
+        zip_content: bytes = multiple_download_files(public_key, paths)
 
-                if response.status_code == 200:
-                    download_url = response.json().get('href')
-                    file_response = requests.get(download_url)
+        response = HttpResponse(zip_content, content_type='application/zip')
+        response[
+            'Content-Disposition'] = f"attachment; filename={datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
 
-                    if file_response.status_code == 200:
-                        file_name = path.split('/')[-1]
-                        file_content = file_response.content
-
-                        if file_content:
-                            zip_file.writestr(file_name, file_content)
-                        else:
-                            print(f"Файл {file_name} пустой или не удалось загрузить содержимое.")
-                    else:
-                        print(f"Не удалось загрузить файл {path}. Статус: {file_response.status_code}")
-                else:
-                    print(f"Не удалось получить ссылку для скачивания для {path}. Статус: {response.status_code}")
-
-        zip_buffer.seek(0)
-
-        response = HttpResponse(zip_buffer.getvalue(), content_type='application/zip')
-        response['Content-Disposition'] = f"attachment; filename={datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         return response
